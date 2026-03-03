@@ -513,7 +513,7 @@
     },
     "net_colors": null,
     "netclass_assignments": {
-      "/BUCK_VIN": [
+      "BUCK_VIN": [
         "HV"
       ]
     },
