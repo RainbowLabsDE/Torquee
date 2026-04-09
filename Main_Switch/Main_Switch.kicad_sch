@@ -5443,7 +5443,7 @@
 	)
 	(global_label "SNS_VOUT"
 		(shape input)
-		(at 55.88 130.81 0)
+		(at 55.88 133.35 0)
 		(fields_autoplaced yes)
 		(effects
 			(font
@@ -5453,7 +5453,7 @@
 		)
 		(uuid "2f5bb5ff-e6d5-4f0d-b018-3d4859971f01")
 		(property "Intersheetrefs" "${INTERSHEET_REFS}"
-			(at 68.2995 130.81 0)
+			(at 68.2995 133.35 0)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -5685,7 +5685,7 @@
 	)
 	(global_label "SNS_VIN"
 		(shape input)
-		(at 55.88 133.35 0)
+		(at 55.88 130.81 0)
 		(fields_autoplaced yes)
 		(effects
 			(font
@@ -5695,7 +5695,7 @@
 		)
 		(uuid "8aebd0ad-9f0c-4659-87d5-27d5dca532dc")
 		(property "Intersheetrefs" "${INTERSHEET_REFS}"
-			(at 66.6062 133.35 0)
+			(at 66.6062 130.81 0)
 			(effects
 				(font
 					(size 1.27 1.27)
