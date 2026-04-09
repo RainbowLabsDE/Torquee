@@ -1,2 +1,4 @@
 *.lck
 *.FCBak
+*-backups
+fp-info-cache
