@@ -1,5 +1,6 @@
 #include "ch32fun.h"
 #include <stdio.h>
+#include <stdbool.h>
 
 // TODOs
 // - DMA ADC reading
@@ -18,13 +19,34 @@
 static const int PIN_CONTACTOR = PC3;
 static const int PIN_PRECHG = PC5;              // TIM2 CH1 (with remap)
 static const int PIN_LED_STATUS = PC4;
-static const int ADC_CHANNEL_VIN = ANALOG_0;   // PA2
-static const int ADC_CHANNEL_VOUT = ANALOG_1;  // PA1
+static const int ADC_CHANNEL_VIN = ANALOG_0;    // PA2
+static const int ADC_CHANNEL_VOUT = ANALOG_1;   // PA1
+
+static const int PWM_MAX_VAL = 4095;
+
+
+static const int FIXED_POINT_ACCURACY = 16;     // bits
+static const int FIXED_POINT_MASK = ((1 << FIXED_POINT_ACCURACY) - 1);
+#define FIXPT_FROM_INT(a) ((a) << FIXED_POINT_ACCURACY)
+#define FIXPT_TO_INT(a) ((a) >> FIXED_POINT_ACCURACY)
+#define FIXPT_TO_FRAC_MP(a, multiplier) ((long long)((a) & FIXED_POINT_MASK) * multiplier / (1 << FIXED_POINT_ACCURACY))
+#define FIXPT_TO_FRAC(a) (FIXPT_TO_FRAC_MP(a, 100000))
+#define FIXPT_PRINTF(a, intDigits, fracMultiplier) printf("%*d.%0d", intDigits, FIXPT_TO_INT(a), FIXPT_TO_FRAC_MP(a, fracMultiplier))
 
 
 static const int R1 = 120000, R2 = 10000, VCC = 5063;
 static const int ADC_FULL_SCALE_MV = VCC * (R1+R2) / R2;
 #define ADC_TO_MV(adcVal) ( adcVal * ADC_FULL_SCALE_MV / 1023 ) // do it like this to circumvent integer imprecision
+
+static const int TARGET_SLOPE_MV_S = 50000;     		// mV / s
+static const int TARGET_SLOPE = (TARGET_SLOPE_MV_S * 1023 / ADC_FULL_SCALE_MV); // ADC bits / s
+static const int PRECHG_LOOP_INTERVAL = 100;    		// µs
+static const int PRECHG_ADC_AVG_DIVISOR = 16;  		 	// moving average divisor (the higher the slower the filter)
+static const int ADC_AVG_BUF_SIZE = 8;
+static const int PRECHG_UPDATE_HISTORY_INTERVAL = 8;    // update history every X iterations
+static const int LAST_HISTORY_ENTRY_ELAPSED = PRECHG_LOOP_INTERVAL * (PRECHG_UPDATE_HISTORY_INTERVAL-1) * ADC_AVG_BUF_SIZE;  // µs, how long the last history entry was ago
+bool doPrecharge = true;
+
 
 #define MODE_OUTPUT GPIO_Speed_10MHz | GPIO_CNF_OUT_PP
 #define MODE_ALTFUNC GPIO_Speed_10MHz | GPIO_CNF_OUT_PP_AF
@@ -60,7 +82,7 @@ void t2pwm_init( void )
 	// set TIM2 clock prescaler divider 
 	TIM2->PSC = 0x0000;
 	// set PWM total cycle width
-	TIM2->ATRLR = 4095;
+	TIM2->ATRLR = PWM_MAX_VAL;
 	
 	// for channel 1 and 2, let CCxS stay 00 (output), set OCxM to 110 (PWM I)
 	// enabling preload causes the new pulse width in compare capture register only to come into effect when UG bit in SWEVGR is set (= initiate update) (auto-clears)
@@ -92,6 +114,95 @@ void t2pwm_setpw(uint8_t chl, uint16_t width)
 }
 
 
+uint32_t lastPrechargeLoop = 0;
+bool prechargeLoopFirstRun = true;
+uint8_t prechargeLoopIterations = 0;    // overflows at UPDATE_HISTORY_INTERVAL
+
+int adcVinAvg = 0, adcVoutAvg = 0;  // fixed point
+int adcVoutAvgBuf[ADC_AVG_BUF_SIZE];
+int adcVoutAvgBufIdx = 0;   // points to next location that will be written to
+
+void prechargeLoop() {
+    if (funSysTick32() - lastPrechargeLoop > Ticks_from_Us(PRECHG_LOOP_INTERVAL)) {
+        lastPrechargeLoop = funSysTick32();
+        prechargeLoopIterations++;
+        
+        // TODO: replace with DMA ADC?
+        int adcVin = funAnalogRead(ADC_CHANNEL_VIN);
+        int adcVout = funAnalogRead(ADC_CHANNEL_VOUT);
+        
+        // initialize averages faster
+        if (prechargeLoopFirstRun) {
+            prechargeLoopFirstRun = false;
+            
+            adcVinAvg = FIXPT_FROM_INT(adcVin);
+            adcVoutAvg = FIXPT_FROM_INT(adcVout);
+            
+            for (int i = 0; i < ADC_AVG_BUF_SIZE; i++) {
+                adcVoutAvgBuf[i] = adcVoutAvg;
+            }
+        }
+        
+        // calculate simple moving average
+        adcVinAvg -= adcVinAvg / PRECHG_ADC_AVG_DIVISOR;
+        adcVinAvg += FIXPT_FROM_INT(adcVin) / PRECHG_ADC_AVG_DIVISOR;
+        adcVoutAvg -= adcVoutAvg / PRECHG_ADC_AVG_DIVISOR;
+        adcVoutAvg += FIXPT_FROM_INT(adcVin) / PRECHG_ADC_AVG_DIVISOR;
+        
+        
+        int historyVal = adcVoutAvgBuf[adcVoutAvgBufIdx];
+        int deltaAvg = FIXPT_TO_INT(adcVoutAvg - historyVal);
+        int usSinceHistoryVal = LAST_HISTORY_ENTRY_ELAPSED + PRECHG_LOOP_INTERVAL * prechargeLoopIterations;    // also calc sub-history-entry-interval time
+        int slopeBitsPerS = deltaAvg * 1'000'000 / usSinceHistoryVal;
+        if (slopeBitsPerS > INT16_MAX) {
+            slopeBitsPerS = INT16_MAX;
+        }
+
+        int pwmPercent = FIXPT_FROM_INT(0);
+        if (slopeBitsPerS < TARGET_SLOPE/2) {
+            pwmPercent = FIXPT_FROM_INT(1);
+        }
+        else if (slopeBitsPerS > (TARGET_SLOPE*3/2)) {
+            pwmPercent = FIXPT_FROM_INT(0);
+        }
+        else {
+            int slope = FIXPT_FROM_INT(slopeBitsPerS);
+            const int valFrom = FIXPT_FROM_INT(TARGET_SLOPE/2);
+            const int valTo = FIXPT_FROM_INT(TARGET_SLOPE*3/2);
+
+            pwmPercent = FIXPT_FROM_INT(1);            // invert 0-1 range
+            pwmPercent -= ((slope - valFrom) / (valTo - valFrom));   // calculate simple ratio. 
+        }
+
+        int pwmVal = FIXPT_TO_INT(pwmPercent * PWM_MAX_VAL);
+		if (!doPrecharge) {
+			pwmVal = 0;
+		}
+        t2pwm_setpw(0, pwmVal);
+
+        
+        // update history every X iterations
+        if (prechargeLoopIterations >= PRECHG_UPDATE_HISTORY_INTERVAL) {
+            prechargeLoopIterations = 0;
+
+            adcVoutAvgBuf[adcVoutAvgBufIdx] = adcVoutAvg;
+            adcVoutAvgBufIdx++;
+            if (adcVoutAvgBufIdx >= ADC_AVG_BUF_SIZE) {
+                adcVoutAvgBufIdx = 0;
+            }
+
+            printf("%8ld,%4d,%4d,%5d,%4d\n", 
+                funSysTick32()/DELAY_US_TIME,
+                FIXPT_TO_INT(adcVinAvg),
+                FIXPT_TO_INT(adcVoutAvg),
+                slopeBitsPerS,
+                pwmVal
+            );
+        }
+    }
+}
+
+
 int main()
 {
     SysTick->CNT = 0;
@@ -103,8 +214,8 @@ int main()
 	funPinMode( PIN_LED_STATUS, MODE_OUTPUT );
 	funPinMode( PIN_PRECHG, MODE_OUTPUT );
 	funPinMode( PIN_CONTACTOR, MODE_OUTPUT );
-    funDigitalWrite( PIN_PRECHG, FUN_LOW);
-    funDigitalWrite( PIN_CONTACTOR, FUN_LOW);
+    funDigitalWrite( PIN_PRECHG, FUN_LOW );
+    funDigitalWrite( PIN_CONTACTOR, FUN_LOW );
     // Analog pins don't need to be set, because that's the default state
     
     funAnalogInit();
@@ -117,23 +228,6 @@ int main()
 
     iwdg_setup(100, IWDG_Prescaler_128);  // setup watchdog to 100 ms (runs at 1kHz -> timeout after 100 cycles)
 
-
-
-	// while(1)
-	// {
-	// 	funDigitalWrite( PIN_LED_STATUS, FUN_LOW );
-	// 	funDigitalWrite( PIN_PRECHG, FUN_HIGH );
-	// 	Delay_Ms( 250 );
-	// 	funDigitalWrite( PIN_LED_STATUS, FUN_HIGH );
-	// 	funDigitalWrite( PIN_PRECHG, FUN_LOW );
-	// 	Delay_Ms( 250 );
-
-    //     int adcVin = funAnalogRead(ADC_CHANNEL_VIN);
-    //     int adcVout = funAnalogRead(ADC_CHANNEL_VOUT);
-
-    //     printf("ADC:    %4d, %4dn", adcVin, adcVout);
-    //     printf("ADC mV: %5d, %5d\n", ADC_TO_MV(adcVin), ADC_TO_MV(adcVout));
-	// }
 
     uint32_t lastBlink = 0, lastADCRead = 0;
 
@@ -148,28 +242,30 @@ int main()
 		    // funDigitalWrite( PIN_PRECHG, !state );
         }
 
-        if (funSysTick32() - lastADCRead > Ticks_from_Ms(1)) {
-            lastADCRead = funSysTick32();
+        // if (funSysTick32() - lastADCRead > Ticks_from_Ms(1)) {
+        //     lastADCRead = funSysTick32();
 
-            int adcVin = funAnalogRead(ADC_CHANNEL_VIN);
-            int adcVout = funAnalogRead(ADC_CHANNEL_VOUT);
+        //     int adcVin = funAnalogRead(ADC_CHANNEL_VIN);
+        //     int adcVout = funAnalogRead(ADC_CHANNEL_VOUT);
 
-            printf("%6ld,%4d,%4d,%5d,%5d\n", funSysTick32()/DELAY_MS_TIME, adcVin, adcVout, ADC_TO_MV(adcVin), ADC_TO_MV(adcVout));
-        }
+        //     printf("%6ld,%4d,%4d,%5d,%5d\n", funSysTick32()/DELAY_MS_TIME, adcVin, adcVout, ADC_TO_MV(adcVin), ADC_TO_MV(adcVout));
+        // }
 
-        if (funSysTick32() > Ticks_from_Ms(11000)) {
-            funDigitalWrite( PIN_PRECHG, FUN_LOW);
-            t2pwm_setpw(0, 0); // turn off precharge FET RC filter
+        // if (funSysTick32() > Ticks_from_Ms(11000)) {
+        //     funDigitalWrite( PIN_PRECHG, FUN_LOW);
+        //     t2pwm_setpw(0, 0); // turn off precharge FET RC filter
 
-        }
-        else if (funSysTick32() > Ticks_from_Ms(2000)) {
-            t2pwm_setpw(0, (4095/3)); // slow down precharge FET RC filter
-        }
-        else if (funSysTick32() > Ticks_from_Ms(1000)) {
-            // funDigitalWrite( PIN_PRECHG, FUN_HIGH);
-            t2pwm_setpw(0, 4095); // turn on precharge FET RC filter fully for 1s
-            funDigitalWrite( PIN_CONTACTOR, FUN_HIGH);
-        }
+        // }
+        // else if (funSysTick32() > Ticks_from_Ms(2000)) {
+        //     t2pwm_setpw(0, (4095/3)); // slow down precharge FET RC filter
+        // }
+        // else if (funSysTick32() > Ticks_from_Ms(1000)) {
+        //     // funDigitalWrite( PIN_PRECHG, FUN_HIGH);
+        //     t2pwm_setpw(0, 4095); // turn on precharge FET RC filter fully for 1s
+        //     funDigitalWrite( PIN_CONTACTOR, FUN_HIGH);
+        // }
+
+        prechargeLoop();
 
         iwdg_feed();
     }
