@@ -42,8 +42,8 @@ static const int ADC_FULL_SCALE_MV = VCC * (R1+R2) / R2;
 static const int TARGET_SLOPE_MV_S = 50000;     		// mV / s
 static const int TARGET_SLOPE = (TARGET_SLOPE_MV_S * 1023 / ADC_FULL_SCALE_MV); // ADC bits / s
 static const int PRECHG_LOOP_INTERVAL = 100;    		// µs
-static const int PRECHG_ADC_AVG_DIVISOR = 4;  		 	// moving average divisor for adc read values (the higher the slower the filter)
-static const int PRECHG_VIN_HISTORY_BUF_SIZE = 32;
+static const int PRECHG_ADC_AVG_DIVISOR = 8;  		 	// moving average divisor for adc read values (the higher the slower the filter)
+static const int PRECHG_VIN_HISTORY_BUF_SIZE = 16;
 static const int PRECHG_VIN_HISTORY_AVG_COUNT = 4;      // how many history samples to average
 static const int PRECHG_UPDATE_HISTORY_INTERVAL = 8;    // update history every X iterations
 static const int LAST_HISTORY_ENTRY_ELAPSED = PRECHG_LOOP_INTERVAL * ((PRECHG_UPDATE_HISTORY_INTERVAL-1) * PRECHG_VIN_HISTORY_BUF_SIZE);  // µs, how long the last history entry was ago
@@ -171,7 +171,7 @@ void prechargeLoop() {
         }
 
         fip_16_t pwmPercent = FIXPT_FROM_INT(0);
-        if (slopeBitsPerS < TARGET_SLOPE/2) {
+        if (slopeBitsPerS < 0) {
             pwmPercent = FIXPT_FROM_INT(1);
         }
         else if (slopeBitsPerS > (TARGET_SLOPE*3/2)) {
@@ -179,7 +179,7 @@ void prechargeLoop() {
         }
         else {
             fip_16_t slope = FIXPT_FROM_INT(slopeBitsPerS);
-            const fip_16_t valMin = FIXPT_FROM_INT(TARGET_SLOPE/2);
+            const fip_16_t valMin = FIXPT_FROM_INT(0);
             const fip_16_t valMax = FIXPT_FROM_INT(TARGET_SLOPE*3/2);
 
             pwmPercent = FIXPT_FROM_INT(1);            // invert 0-1 range
